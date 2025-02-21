@@ -1,0 +1,127 @@
+name: inspect_point_ai_dataintegration
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  docker_cicd:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: GitHubActionsSession
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Docker Image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Building Docker image..."
+          docker build -f ./ai-data-integration-lambda/Dockerfile -t $REGISTRY/$REPOSITORY:$IMAGE_TAG ./ai-data-integration-lambda && \
+          echo "Pushing Docker image to Amazon ECR..."
+          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy Lambda Function
+        env:
+          FUNCTION_NAME: inspect_point_ai_dataintegration
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY_NAME }}:${{ github.sha }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          echo "Retrieving AWS Account ID..."
+          ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          echo "AWS Account ID: $ACCOUNT_ID"
+
+          echo "Checking if Lambda function exists..."
+          ATTEMPTS=0
+          MAX_ATTEMPTS=5
+          while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+            if aws lambda get-function --function-name $FUNCTION_NAME; then
+              echo "Function exists. Updating..."
+              if aws lambda update-function-code --function-name $FUNCTION_NAME --image-uri $IMAGE_URI; then
+                echo "Lambda function updated successfully."
+                break
+              else
+                echo "Update failed, retrying in 5 seconds..."
+                ATTEMPTS=$((ATTEMPTS+1))
+                sleep 5
+              fi
+            else
+              echo "Function does not exist. Creating..."
+              if aws lambda create-function \
+                --function-name $FUNCTION_NAME \
+                --role $AWS_ROLE_ARN \
+                --package-type Image \
+                --code '{"ImageUri":"'"$IMAGE_URI"'"}' \
+                --timeout 900 \
+                --memory-size 1024 \
+                --region $AWS_REGION; then
+                echo "Lambda function created successfully."
+                break
+              else
+                echo "Creation failed, retrying in 5 seconds..."
+                ATTEMPTS=$((ATTEMPTS+1))
+                sleep 5
+              fi
+            fi
+          done
+
+          if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+            echo "Max retries reached. Exiting with failure."
+            exit 1
+          fi
+
+      - name: Add S3 Trigger
+        env:
+          FUNCTION_NAME: inspect_point_ai_dataintegration
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          S3_EVENT_SUFFIX: .pdf
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "Granting S3 permission to invoke the Lambda function..."
+          ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+          aws lambda add-permission \
+            --function-name $FUNCTION_NAME \
+            --statement-id s3-trigger \
+            --action lambda:InvokeFunction \
+            --principal s3.amazonaws.com \
+            --source-arn arn:aws:s3:::$S3_BUCKET_NAME \
+            --source-account $ACCOUNT_ID || echo "Permission already exists."
+
+          echo "Adding S3 trigger for bucket: $S3_BUCKET_NAME and suffix: $S3_EVENT_SUFFIX..."
+          aws s3api put-bucket-notification-configuration \
+            --bucket $S3_BUCKET_NAME \
+            --notification-configuration '{
+              "LambdaFunctionConfigurations": [
+                {
+                  "LambdaFunctionArn": "arn:aws:lambda:'"$AWS_REGION"':'"$ACCOUNT_ID"':function:'"$FUNCTION_NAME"'",
+                  "Events": ["s3:ObjectCreated:Put"],
+                  "Filter": {
+                    "Key": {
+                      "FilterRules": [
+                        {"Name": "suffix", "Value": ".pdf"}
+                      ]
+                    }
+                  }
+                }
+              ]
+            }'
+
+          echo "S3 trigger added successfully."
